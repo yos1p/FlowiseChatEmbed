@@ -1,4 +1,6 @@
 import { createSignal, createEffect, For, onMount, Show, mergeProps, on, createMemo } from 'solid-js';
+import io from 'socket.io-client';
+import { Socket } from 'socket.io-client';
 import { v4 as uuidv4 } from 'uuid';
 import {
   sendMessageQuery,
@@ -69,7 +71,7 @@ type FilePreview = {
   type: string;
 };
 
-type messageType = 'apiMessage' | 'userMessage' | 'usermessagewaiting' | 'leadCaptureMessage';
+type messageType = 'apiMessage' | 'userMessage' | 'usermessagewaiting' | 'leadCaptureMessage' | 'audioMessage';
 
 export type IAgentReasoning = {
   agentName?: string;
@@ -111,6 +113,7 @@ export type MessageType = {
   id?: string;
   followUpPrompts?: string;
   dateTime?: string;
+  audioUrl?: string;
 };
 
 type IUploads = {
@@ -297,12 +300,44 @@ export const Bot = (botProps: BotProps & { class?: string }) => {
   const [isDragActive, setIsDragActive] = createSignal(false);
   const [uploadedFiles, setUploadedFiles] = createSignal<{ file: File; type: string }[]>([]);
 
+  // Socket.IO
+  const [socket, setSocket] = createSignal<Socket | null>(null);
+  const [audioBufferQueue, setAudioBufferQueue] = createSignal<Array<ArrayBuffer>>([]);
+  const [audioStore, setAudioStore] = createSignal<ArrayBuffer>();
+  const audioContext = new window.AudioContext();
+  let isPlaying = false;
+  let playerStarted = false;
+
   createMemo(() => {
     const customerId = (props.chatflowConfig?.vars as any)?.customerId;
     setChatId(customerId ? `${customerId.toString()}+${uuidv4()}` : uuidv4());
   });
 
   onMount(() => {
+    const socketInstance = io(props.apiHost);
+    setSocket(socketInstance);
+
+    socketInstance.on('connect', () => {
+      console.log('Connected to Socket.IO server');
+    });
+
+    socketInstance.on('disconnect', () => {
+      console.log('Disconnected from Socket.IO server');
+    });
+
+    socketInstance.on('message', (data) => {
+      if (data.type === 'audio') {
+        const audioDataForPlay = decodeBase64Data(data.data);
+        setAudioBufferQueue((prevQueue) => [...prevQueue, audioDataForPlay]);
+        if (!playerStarted) {
+          playAudio();
+          playerStarted = true;
+        }
+        const audioData = decodeBase64Data(data.data);
+        setAudioStore((prevData) => (prevData ? combineAudioData([prevData, audioData]) : audioData));
+      }
+    });
+
     if (botProps?.observersConfig) {
       const { observeUserInput, observeLoading, observeMessages } = botProps.observersConfig;
       typeof observeUserInput === 'function' &&
@@ -327,6 +362,70 @@ export const Bot = (botProps: BotProps & { class?: string }) => {
       chatContainer?.scrollTo(0, chatContainer.scrollHeight);
     }, 50);
   });
+
+  const playAudio = async () => {
+    if (isPlaying) return;
+
+    console.log('Playing audio');
+    const queue = audioBufferQueue();
+    if (queue.length > 0) {
+      const audioData = queue.shift();
+      if (audioData) {
+        console.log('Playing audio data');
+        setAudioBufferQueue(queue);
+
+        const audioBuffer = await audioContext.decodeAudioData(audioData);
+        const source = audioContext.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(audioContext.destination);
+        source.start();
+        source.onended = () => {
+          console.log('Playing next track');
+          isPlaying = false;
+          playAudio();
+        };
+      }
+    } else {
+      playerStarted = false;
+      isPlaying = false;
+
+      const fullAudio = audioStore();
+      if (fullAudio) {
+        // Add all the audioBuffer to the messages
+        setMessages((prevMessages) => {
+          const allMessages = [...cloneDeep(prevMessages)];
+          allMessages.push({
+            message: '',
+            type: 'audioMessage',
+            // Convert the fullAudio that is AudioBuffer to the url
+            audioUrl: URL.createObjectURL(new Blob([fullAudio], { type: 'audio/mp3' })),
+          });
+          addChatMessage(allMessages);
+          return allMessages;
+        });
+      }
+    }
+  };
+
+  const decodeBase64Data = function (data: string): ArrayBuffer {
+    const binaryString = window.atob(data);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) {
+      bytes[i] = binaryString.charCodeAt(i);
+    }
+    return bytes.buffer;
+  };
+
+  const combineAudioData = (buffers: Array<ArrayBuffer>) => {
+    const length = buffers.reduce((acc, buffer) => acc + buffer.byteLength, 0);
+    const result = new Uint8Array(length);
+    let offset = 0;
+    buffers.forEach((buffer) => {
+      result.set(new Uint8Array(buffer), offset);
+      offset += buffer.byteLength;
+    });
+    return result.buffer;
+  };
 
   const scrollToBottom = () => {
     setTimeout(() => {
@@ -770,6 +869,10 @@ export const Bot = (botProps: BotProps & { class?: string }) => {
     if (leadEmail()) body.leadEmail = leadEmail();
 
     if (action) body.action = action;
+
+    if (socket()) {
+      body.socketIOClientId = socket()?.id;
+    }
 
     if (isChatFlowAvailableToStream()) {
       fetchResponseFromEventStream(props.chatflowid, body);
@@ -1490,6 +1593,11 @@ export const Bot = (botProps: BotProps & { class?: string }) => {
                         setIsLeadSaved={setIsLeadSaved}
                         setLeadEmail={setLeadEmail}
                       />
+                    )}
+                    {message.type === 'audioMessage' && (
+                      <div class="audio-message">
+                        <audio controls src={message.audioUrl} />
+                      </div>
                     )}
                     {message.type === 'userMessage' && loading() && index() === messages().length - 1 && <LoadingBubble />}
                     {message.type === 'apiMessage' && message.message === '' && loading() && index() === messages().length - 1 && <LoadingBubble />}
